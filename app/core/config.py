@@ -1,0 +1,5 @@
+ENROLLMENTS_DIR = r"enrollments"
+UPLOAD_DIR = r"uploads"
+CLASSROOM_TEST_DIR = r"classroom_test_images"
+CLASSROOM_SESSION_DIR = r"classroom_session_images"
+SESSION_PDFS_DIR = "session_pdfs"
