@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from app.core.time_utils import now_syria
 
 from fastapi.responses import FileResponse
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Body, Depends, HTTPException, UploadFile, File
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
@@ -33,6 +33,7 @@ from app.models import (
     Teacher,
     StudentNotification,
     StudentDeviceToken,
+    CourseSection,
 )
 from app.schemas.student_schema import RegisterRequest
 
@@ -71,12 +72,27 @@ def get_sessions(
     current_student: Student = Depends(get_current_student),
     db: Session = Depends(get_db)
 ):
+    enrollments = (
+        db.query(StudentCourse)
+        .filter(StudentCourse.student_id == current_student.student_id)
+        .all()
+    )
+
+    if not enrollments:
+        return []
+
+    enrollment_by_course = {
+        enrollment.course_id: enrollment
+        for enrollment in enrollments
+    }
+
+    course_ids = list(enrollment_by_course.keys())
+
     records = (
         db.query(ClassSession, Course, Classroom)
         .join(Course, ClassSession.course_id == Course.course_id)
         .join(Classroom, ClassSession.classroom_id == Classroom.classroom_id)
-        .join(StudentCourse, StudentCourse.course_id == Course.course_id)
-        .filter(StudentCourse.student_id == current_student.student_id)
+        .filter(ClassSession.course_id.in_(course_ids))
         .all()
     )
 
@@ -84,13 +100,26 @@ def get_sessions(
     now = now_syria()
 
     for session, course, classroom in records:
-        session_end = datetime.combine(session.session_date, session.end_time)
+        enrollment = enrollment_by_course[course.course_id]
+        session_type = session.session_type or "theory"
 
-        # Skip past sessions
-        if session_end < now:
+        # Theory: every enrolled student can see it.
+        # Practical: only students assigned to this exact section can see it.
+        if (
+            session_type == "practical"
+            and enrollment.section_id != session.section_id
+        ):
             continue
 
-        # Skip sessions already submitted by this student
+        attendance_close_dt = datetime.combine(
+            session.session_date,
+            session.attendance_close_time
+        )
+
+        # Do not show expired attendance sessions.
+        if attendance_close_dt <= now:
+            continue
+
         existing_attendance = (
             db.query(Attendance)
             .filter(
@@ -100,11 +129,13 @@ def get_sessions(
             .first()
         )
 
+        # A submitted session should disappear from the available sessions page.
         if existing_attendance:
             continue
 
         result.append({
             "session_id": session.session_id,
+            "session_type": session_type,
             "session_date": str(session.session_date),
             "start_time": str(session.start_time),
             "end_time": str(session.end_time),
@@ -429,45 +460,67 @@ def get_student_attendance(
     current_student: Student = Depends(get_current_student),
     db: Session = Depends(get_db)
 ):
-    enrollments = db.query(StudentCourse).filter(
-        StudentCourse.student_id == current_student.student_id
-    ).all()
+    enrollments = (
+        db.query(StudentCourse)
+        .filter(StudentCourse.student_id == current_student.student_id)
+        .all()
+    )
 
     if not enrollments:
         return []
 
-    course_ids = [en.course_id for en in enrollments]
+    enrollment_by_course = {
+        enrollment.course_id: enrollment
+        for enrollment in enrollments
+    }
 
-    sessions = db.query(ClassSession).filter(
-        ClassSession.course_id.in_(course_ids)
-    ).all()
+    course_ids = list(enrollment_by_course.keys())
+
+    sessions = (
+        db.query(ClassSession)
+        .filter(ClassSession.course_id.in_(course_ids))
+        .all()
+    )
 
     result = []
     now = now_syria()
 
     for session in sessions:
-        attendance = db.query(Attendance).filter(
-            Attendance.session_id == session.session_id,
-            Attendance.student_id == current_student.student_id
-        ).first()
+        enrollment = enrollment_by_course[session.course_id]
+        session_type = session.session_type or "theory"
+
+        # Theory belongs to every enrolled student.
+        # Practical belongs only to the student's selected section.
+        if (
+            session_type == "practical"
+            and enrollment.section_id != session.section_id
+        ):
+            continue
+
+        attendance = (
+            db.query(Attendance)
+            .filter(
+                Attendance.session_id == session.session_id,
+                Attendance.student_id == current_student.student_id
+            )
+            .first()
+        )
 
         attendance_close_dt = datetime.combine(
             session.session_date,
             session.attendance_close_time
         )
 
-        # If attendance exists, show it immediately as Present
         if attendance:
             status = "Present"
-        # If no attendance yet and window still open, skip for now
         elif attendance_close_dt > now:
             continue
-        # If no attendance and window closed, mark Absent
         else:
             status = "Absent"
 
         result.append({
             "session_id": session.session_id,
+            "session_type": session_type,
             "course_name": session.course.course_name,
             "session_date": str(session.session_date),
             "start_time": str(session.start_time),
@@ -632,7 +685,7 @@ def get_student_my_courses(
     if not enrollments:
         return []
 
-    now = datetime.now()
+    now = now_syria()
     result = []
 
     for enrollment, course, teacher in enrollments:
@@ -641,12 +694,45 @@ def get_student_my_courses(
             .filter(ClassSession.course_id == course.course_id)
             .all()
         )
+        active_practical_sections = (
+            db.query(CourseSection)
+            .filter(
+                CourseSection.course_id == course.course_id,
+                CourseSection.is_active == True
+            )
+            .count()
+        )
+
+        selected_section_name = None
+
+        if enrollment.section_id is not None:
+            selected_section = (
+                db.query(CourseSection)
+                .filter(
+                    CourseSection.section_id == enrollment.section_id,
+                    CourseSection.course_id == course.course_id
+                )
+                .first()
+            )
+
+            if selected_section:
+                selected_section_name = selected_section.section_name
 
         attended_count = 0
         absent_count = 0
         total_sessions = 0
 
         for session in course_sessions:
+            session_type = session.session_type or "theory"
+
+            # Theory belongs to every enrolled student.
+            # Practical belongs only to the student's selected section.
+            if (
+                session_type == "practical"
+                and enrollment.section_id != session.section_id
+            ):
+                continue
+
             attendance = (
                 db.query(Attendance)
                 .filter(
@@ -692,6 +778,9 @@ def get_student_my_courses(
             "course_name": course.course_name,
             "year_of_study": course.year_of_study,
             "is_active": course.is_active,
+            "selected_section_id": enrollment.section_id,
+            "selected_section_name": selected_section_name,
+            "has_practical_sections": active_practical_sections > 0,
             "teacher": {
                 "teacher_id": teacher.teacher_id,
                 "full_name": teacher.full_name,
@@ -710,6 +799,231 @@ def get_student_my_courses(
 
     return result
 
+
+# This part is for section Registration
+
+
+@router.get("/student/courses/{course_id}/practical-sections")
+def get_student_practical_sections(
+    course_id: int,
+    current_student: Student = Depends(get_current_student),
+    db: Session = Depends(get_db)
+):
+    enrollment = (
+        db.query(StudentCourse)
+        .filter(
+            StudentCourse.student_id == current_student.student_id,
+            StudentCourse.course_id == course_id
+        )
+        .first()
+    )
+
+    if not enrollment:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not enrolled in this course"
+        )
+
+    course = (
+        db.query(Course)
+        .filter(Course.course_id == course_id)
+        .first()
+    )
+
+    if not course:
+        raise HTTPException(
+            status_code=404,
+            detail="Course not found"
+        )
+
+    sections = (
+        db.query(CourseSection)
+        .filter(
+            CourseSection.course_id == course_id,
+            CourseSection.is_active == True
+        )
+        .order_by(CourseSection.section_name.asc())
+        .all()
+    )
+
+    result = []
+
+    for section in sections:
+        enrolled_students_count = (
+            db.query(StudentCourse)
+            .filter(StudentCourse.section_id == section.section_id)
+            .count()
+        )
+
+        section_schedules = [
+            {
+                "weekday": schedule.weekday,
+                "weekday_name": [
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
+                    "Sunday",
+                ][schedule.weekday],
+                "start_time": str(schedule.start_time),
+                "end_time": str(schedule.end_time),
+                "repeat_interval_weeks": schedule.repeat_interval_weeks,
+            }
+            for schedule in section.schedules
+            if schedule.is_active
+        ]
+
+        result.append(
+            {
+                "section_id": section.section_id,
+                "section_name": section.section_name,
+                "capacity": section.capacity,
+                "classroom_id": section.classroom_id,
+                "classroom_name": section.classroom.name,
+                "building": section.classroom.building,
+                "room_number": section.classroom.room_number,
+                "enrolled_students_count": enrolled_students_count,
+                "available_seats": max(
+                    section.capacity - enrolled_students_count,
+                    0
+                ),
+                "schedules": section_schedules,
+                "is_selected_by_student": (
+                    enrollment.section_id == section.section_id
+                )
+            }
+        )
+
+    return {
+        "course": {
+            "course_id": course.course_id,
+            "course_name": course.course_name
+        },
+        "selected_section_id": enrollment.section_id,
+        "sections": result
+    }
+
+
+@router.post("/student/courses/{course_id}/select-practical-section")
+def select_student_practical_section(
+    course_id: int,
+    section_id: int = Body(..., embed=True),
+    current_student: Student = Depends(get_current_student),
+    db: Session = Depends(get_db)
+):
+    if not current_student.is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="Student account is inactive"
+        )
+
+    # Lock this student's enrollment row while selecting/switching.
+    enrollment = (
+        db.query(StudentCourse)
+        .filter(
+            StudentCourse.student_id == current_student.student_id,
+            StudentCourse.course_id == course_id
+        )
+        .with_for_update()
+        .first()
+    )
+
+    if not enrollment:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not enrolled in this course"
+        )
+
+    # A student cannot change section after practical attendance exists.
+    practical_attendance_exists = (
+        db.query(Attendance)
+        .join(
+            ClassSession,
+            Attendance.session_id == ClassSession.session_id
+        )
+        .filter(
+            Attendance.student_id == current_student.student_id,
+            ClassSession.course_id == course_id,
+            ClassSession.session_type == "practical"
+        )
+        .first()
+    )
+
+    if practical_attendance_exists:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "You cannot change your practical section because "
+                "you already have practical attendance records"
+            )
+        )
+
+    # Lock the selected section too, so two students cannot take
+    # the final available seat at the same time.
+    section = (
+        db.query(CourseSection)
+        .filter(
+            CourseSection.section_id == section_id,
+            CourseSection.course_id == course_id,
+            CourseSection.is_active == True
+        )
+        .with_for_update()
+        .first()
+    )
+
+    if not section:
+        raise HTTPException(
+            status_code=404,
+            detail="Active practical section not found in this course"
+        )
+
+    # If the student already chose this section, return normally.
+    if enrollment.section_id == section.section_id:
+        return {
+            "message": "This practical section is already selected",
+            "course_id": course_id,
+            "section_id": section.section_id,
+            "section_name": section.section_name
+        }
+
+    enrolled_students_count = (
+        db.query(StudentCourse)
+        .filter(StudentCourse.section_id == section.section_id)
+        .count()
+    )
+
+    if enrolled_students_count >= section.capacity:
+        raise HTTPException(
+            status_code=400,
+            detail="This practical section is full"
+        )
+
+    enrollment.section_id = section.section_id
+
+    db.commit()
+    db.refresh(enrollment)
+
+    return {
+        "message": "Practical section selected successfully",
+        "course_id": course_id,
+        "section": {
+            "section_id": section.section_id,
+            "section_name": section.section_name,
+            "classroom_id": section.classroom_id,
+            "classroom_name": section.classroom.name,
+            "enrolled_students_count": enrolled_students_count + 1,
+            "available_seats": max(
+                section.capacity - (enrolled_students_count + 1),
+                0
+            )
+        }
+    }
+
+
+
+# This is the end of the section Registration
 
 
 
@@ -809,16 +1123,33 @@ def get_student_notifications(
     )
 
     for enrollment, course, teacher in enrollments:
-        course_sessions = (
+        all_course_sessions = (
             db.query(ClassSession)
             .filter(ClassSession.course_id == course.course_id)
             .all()
         )
 
+        # Keep only sessions this student is actually allowed to attend.
+        valid_sessions = []
+
+        for session in all_course_sessions:
+            session_type = session.session_type or "theory"
+
+            # Theory belongs to every enrolled student.
+            # Practical belongs only to the student's selected section.
+            if (
+                session_type == "practical"
+                and enrollment.section_id != session.section_id
+            ):
+                continue
+
+            valid_sessions.append(session)
+
+        # ---------- Attendance warning calculation ----------
         attended_count = 0
         total_counted_sessions = 0
 
-        for session in course_sessions:
+        for session in valid_sessions:
             attendance = (
                 db.query(Attendance)
                 .filter(
@@ -864,13 +1195,8 @@ def get_student_notifications(
                     )
                 )
 
-        upcoming_sessions = (
-            db.query(ClassSession)
-            .filter(ClassSession.course_id == course.course_id)
-            .all()
-        )
-
-        for session in upcoming_sessions:
+        # ---------- Session reminder notifications ----------
+        for session in valid_sessions:
             existing_attendance = (
                 db.query(Attendance)
                 .filter(
@@ -898,46 +1224,79 @@ def get_student_notifications(
                 session.attendance_close_time
             )
 
-            if session_start_dt - timedelta(minutes=60) <= now < session_start_dt - timedelta(minutes=45):
+            if (
+                session_start_dt - timedelta(minutes=60)
+                <= now
+                < session_start_dt - timedelta(minutes=45)
+            ):
                 create_notification_if_not_exists(
                     db=db,
                     student_id=current_student.student_id,
                     title="Upcoming Session",
                     message=f"{course.course_name} starts in about 1 hour.",
                     notification_type="session_reminder",
-                    notification_key=f"session_60:{current_student.student_id}:{session.session_id}"
+                    notification_key=(
+                        f"session_60:"
+                        f"{current_student.student_id}:"
+                        f"{session.session_id}"
+                    )
                 )
 
-            if session_start_dt - timedelta(minutes=15) <= now < session_start_dt:
+            if (
+                session_start_dt - timedelta(minutes=15)
+                <= now
+                < session_start_dt
+            ):
                 create_notification_if_not_exists(
                     db=db,
                     student_id=current_student.student_id,
                     title="Session Starting Soon",
                     message=f"{course.course_name} starts in about 15 minutes.",
                     notification_type="session_reminder",
-                    notification_key=f"session_15:{current_student.student_id}:{session.session_id}"
+                    notification_key=(
+                        f"session_15:"
+                        f"{current_student.student_id}:"
+                        f"{session.session_id}"
+                    )
                 )
 
-            if attendance_open_dt <= now < attendance_open_dt + timedelta(minutes=15):
+            if (
+                attendance_open_dt
+                <= now
+                < attendance_open_dt + timedelta(minutes=15)
+            ):
                 create_notification_if_not_exists(
                     db=db,
                     student_id=current_student.student_id,
                     title="Attendance Is Open",
                     message=f"Attendance is now open for {course.course_name}.",
                     notification_type="attendance_open",
-                    notification_key=f"attendance_open:{current_student.student_id}:{session.session_id}"
+                    notification_key=(
+                        f"attendance_open:"
+                        f"{current_student.student_id}:"
+                        f"{session.session_id}"
+                    )
                 )
 
-            if attendance_close_dt - timedelta(minutes=15) <= now < attendance_close_dt:
+            if (
+                attendance_close_dt - timedelta(minutes=15)
+                <= now
+                < attendance_close_dt
+            ):
                 create_notification_if_not_exists(
                     db=db,
                     student_id=current_student.student_id,
                     title="Attendance Closing Soon",
                     message=(
-                        f"Attendance for {course.course_name} closes in about 15 minutes."
+                        f"Attendance for {course.course_name} "
+                        f"closes in about 15 minutes."
                     ),
                     notification_type="attendance_closing",
-                    notification_key=f"attendance_close_15:{current_student.student_id}:{session.session_id}"
+                    notification_key=(
+                        f"attendance_close_15:"
+                        f"{current_student.student_id}:"
+                        f"{session.session_id}"
+                    )
                 )
 
     db.commit()
@@ -1303,6 +1662,20 @@ def get_student_session_pdf_info(
             detail="You are not enrolled in this course"
         )
 
+    session_type = session.session_type or "theory"
+
+    if (
+        session_type == "practical"
+        and enrollment.section_id != session.section_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "You are not assigned to the practical section "
+                "for this session"
+            )
+        )
+
     has_pdf = bool(session.pdf_file_path and os.path.exists(session.pdf_file_path))
 
     return {
@@ -1344,6 +1717,19 @@ def download_student_session_pdf(
         raise HTTPException(
             status_code=403,
             detail="You are not enrolled in this course"
+        )
+    session_type = session.session_type or "theory"
+
+    if (
+        session_type == "practical"
+        and enrollment.section_id != session.section_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "You are not assigned to the practical section "
+                "for this session"
+            )
         )
 
     if not session.pdf_file_path or not os.path.exists(session.pdf_file_path):

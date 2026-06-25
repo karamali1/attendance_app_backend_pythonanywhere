@@ -108,9 +108,35 @@ def submit_attendance(
         .first()
     )
     if not enrollment:
-        raise HTTPException(status_code=403, detail="Student is not enrolled in this course")
+        raise HTTPException(
+            status_code=403,
+            detail="Student is not enrolled in this course"
+        )
 
-    # 3) Check duplicate attendance
+    # 3) Check practical-section authorization
+    session_type = session.session_type or "theory"
+
+    if session_type == "practical":
+        if enrollment.section_id is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "You must select a practical section before submitting "
+                    "attendance for a practical session"
+                )
+            )
+
+    if enrollment.section_id != session.section_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "You are not assigned to the practical section "
+                "for this session"
+            )
+        )
+
+    # 4) Check duplicate attendance
+
     existing_attendance = (
         db.query(Attendance)
         .filter(

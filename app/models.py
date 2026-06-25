@@ -72,6 +72,10 @@ class Classroom(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     sessions = relationship("ClassSession", back_populates="classroom", cascade="all, delete-orphan")
+    practical_sections = relationship("CourseSection", back_populates="classroom")
+
+
+
 
 
 class Course(Base):
@@ -89,6 +93,112 @@ class Course(Base):
     teacher = relationship("Teacher", back_populates="courses")
     students = relationship("StudentCourse", back_populates="course", cascade="all, delete-orphan")
     sessions = relationship("ClassSession", back_populates="course", cascade="all, delete-orphan")
+    sections = relationship("CourseSection", back_populates="course", cascade="all, delete-orphan")
+
+
+
+class CourseSection(Base):
+    __tablename__ = "course_sections"
+    __table_args__ = (
+        UniqueConstraint(
+            "course_id",
+            "section_name",
+            name="uq_course_section_name"
+        ),
+    )
+
+    section_id = Column(Integer, primary_key=True, index=True)
+
+    course_id = Column(
+        Integer,
+        ForeignKey("courses.course_id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    section_name = Column(String(100), nullable=False)
+
+    capacity = Column(Integer, nullable=False)
+
+    classroom_id = Column(
+        Integer,
+        ForeignKey("classrooms.classroom_id", ondelete="RESTRICT"),
+        nullable=False
+    )
+
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    course = relationship("Course", back_populates="sections")
+    classroom = relationship("Classroom", back_populates="practical_sections")
+
+    enrollments = relationship(
+        "StudentCourse",
+        back_populates="section"
+    )
+
+    sessions = relationship(
+        "ClassSession",
+        back_populates="section"
+    )
+    schedules = relationship(
+        "SectionSchedule",
+        back_populates="section",
+        cascade="all, delete-orphan"
+    )
+
+
+class SectionSchedule(Base):
+    __tablename__ = "section_schedules"
+    __table_args__ = (
+        UniqueConstraint(
+            "section_id",
+            "weekday",
+            "start_time",
+            "start_date",
+            name="uq_section_schedule_start"
+        ),
+    )
+
+    schedule_id = Column(Integer, primary_key=True, index=True)
+
+    section_id = Column(
+        Integer,
+        ForeignKey("course_sections.section_id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    # Monday = 0, Tuesday = 1, ..., Sunday = 6
+    weekday = Column(SmallInteger, nullable=False)
+
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+
+    # 1 = every week, 2 = every two weeks
+    repeat_interval_weeks = Column(
+        SmallInteger,
+        nullable=False,
+        default=1
+    )
+
+    start_date = Column(Date, nullable=False)
+
+    # Teacher chooses one of these later:
+    end_date = Column(Date, nullable=True)
+    repeat_for_weeks = Column(Integer, nullable=True)
+
+    # These values will be copied into every generated practical session.
+    attendance_open_time = Column(Time, nullable=False)
+    attendance_close_time = Column(Time, nullable=False)
+
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    section = relationship("CourseSection", back_populates="schedules")
+
+    sessions = relationship(
+        "ClassSession",
+        back_populates="schedule"
+    )
 
 
 class ClassSession(Base):
@@ -97,6 +207,23 @@ class ClassSession(Base):
     session_id = Column(Integer, primary_key=True, index=True)
     course_id = Column(Integer, ForeignKey("courses.course_id"), nullable=False)
     classroom_id = Column(Integer, ForeignKey("classrooms.classroom_id"), nullable=False)
+    session_type = Column(
+        String(20),
+        nullable=False,
+        default="theory"
+    )
+
+    section_id = Column(
+        Integer,
+        ForeignKey("course_sections.section_id", ondelete="RESTRICT"),
+        nullable=True
+    )
+
+    schedule_id = Column(
+        Integer,
+        ForeignKey("section_schedules.schedule_id", ondelete="SET NULL"),
+        nullable=True
+    )
 
     session_date = Column(Date, nullable=False)
     start_time = Column(Time, nullable=False)
@@ -113,6 +240,8 @@ class ClassSession(Base):
     course = relationship("Course", back_populates="sessions")
     classroom = relationship("Classroom", back_populates="sessions")
     attendances = relationship("Attendance", back_populates="session", cascade="all, delete-orphan")
+    section = relationship("CourseSection", back_populates="sessions")
+    schedule = relationship("SectionSchedule", back_populates="sessions")
 
 
 class StudentCourse(Base):
@@ -124,11 +253,17 @@ class StudentCourse(Base):
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("students.student_id"), nullable=False)
     course_id = Column(Integer, ForeignKey("courses.course_id"), nullable=False)
+    section_id = Column(
+        Integer,
+        ForeignKey("course_sections.section_id", ondelete="SET NULL"),
+        nullable=True
+    )
 
     enrolled_at = Column(DateTime, server_default=func.now())
 
     student = relationship("Student", back_populates="enrollments")
     course = relationship("Course", back_populates="students")
+    section = relationship("CourseSection", back_populates="enrollments")
 
 
 class Attendance(Base):

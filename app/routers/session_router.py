@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 
 from app.database import get_db
-from app.dependencies.auth_dependencies import get_current_student
+
 from app.dependencies.auth_dependencies import get_current_teacher
 from app.models import (
     Teacher,
@@ -23,6 +23,7 @@ from app.models import (
     StudentCourse,
     Student,
     Attendance,
+    CourseSection,
 )
 from app.schemas.session_schema import CreateSessionRequest, UpdateSessionRequest
 
@@ -100,6 +101,29 @@ def create_course_session(
             detail="Attendance close time cannot be later than session end time"
         )
 
+
+    existing_conflict = (
+        db.query(ClassSession)
+        .filter(
+            ClassSession.classroom_id == request.classroom_id,
+            ClassSession.session_date == request.session_date,
+            ClassSession.start_time < request.end_time,
+            ClassSession.end_time > request.start_time
+        )
+        .first()
+    )
+
+    if existing_conflict:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This classroom is already booked during the selected time. "
+                f"Existing session: "
+                f"{existing_conflict.start_time.strftime('%H:%M')} - "
+                f"{existing_conflict.end_time.strftime('%H:%M')}"
+            )
+        )
+
     # 5) Create the session
     new_session = ClassSession(
         course_id=course.course_id,
@@ -161,6 +185,14 @@ def update_teacher_session(
         )
 
     session, course = session_record
+    if (session.session_type or "theory") == "practical":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Practical sessions are managed through their section schedule. "
+                "Open the practical schedule screen to edit or delete them."
+            )
+        )
 
     # 2) Check classroom exists
     classroom = (
@@ -265,6 +297,14 @@ def delete_teacher_session(
         )
 
     session, course = session_record
+    if (session.session_type or "theory") == "practical":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Practical sessions are managed through their section schedule. "
+                "Open the practical schedule screen to edit or delete them."
+            )
+        )
 
     attendance_exists = (
         db.query(Attendance)
@@ -313,19 +353,38 @@ def get_session_attendance_report(
         )
 
     session, course, classroom = session_record
+    session_type = session.session_type or "theory"
 
-    enrolled_records = (
+    enrolled_query = (
         db.query(StudentCourse, Student)
         .join(Student, StudentCourse.student_id == Student.student_id)
         .filter(StudentCourse.course_id == course.course_id)
-        .all()
     )
+
+    # Theory: every enrolled student belongs to the report.
+    # Practical: only students assigned to this exact section belong to it.
+    if session_type == "practical":
+        enrolled_query = enrolled_query.filter(
+            StudentCourse.section_id == session.section_id
+        )
+
+    enrolled_records = enrolled_query.all()
+
+    eligible_student_ids = {
+        student.student_id
+        for student_course, student in enrolled_records
+    }
 
     attendance_records = (
         db.query(Attendance, Student)
         .join(Student, Attendance.student_id == Student.student_id)
-        .filter(Attendance.session_id == session_id)
+        .filter(
+            Attendance.session_id == session_id,
+            Attendance.student_id.in_(eligible_student_ids)
+        )
         .all()
+        if eligible_student_ids
+        else []
     )
 
     attended_student_ids = {
@@ -349,10 +408,12 @@ def get_session_attendance_report(
     ]
 
     now = now_syria()
+
     attendance_close_dt = datetime.combine(
         session.session_date,
         session.attendance_close_time
     )
+
     attendance_finalized = attendance_close_dt <= now
 
     absent_students = [
@@ -365,8 +426,19 @@ def get_session_attendance_report(
             "attendance_status": "Absent"
         }
         for student_course, student in enrolled_records
-        if student.student_id not in attended_student_ids and attendance_finalized
+        if (
+            student.student_id not in attended_student_ids
+            and attendance_finalized
+        )
     ]
+
+    section_data = None
+
+    if session_type == "practical" and session.section:
+        section_data = {
+            "section_id": session.section.section_id,
+            "section_name": session.section.section_name
+        }
 
     return {
         "teacher": {
@@ -380,6 +452,8 @@ def get_session_attendance_report(
         },
         "session": {
             "session_id": session.session_id,
+            "session_type": session_type,
+            "section": section_data,
             "session_date": str(session.session_date),
             "start_time": str(session.start_time),
             "end_time": str(session.end_time),
@@ -409,7 +483,6 @@ def get_course_sessions(
     current_teacher: Teacher = Depends(get_current_teacher),
     db: Session = Depends(get_db)
 ):
-    # 1) Check that the course exists and belongs to the logged-in teacher
     course = (
         db.query(Course)
         .filter(
@@ -425,7 +498,6 @@ def get_course_sessions(
             detail="Course not found or does not belong to this teacher"
         )
 
-    # 2) Get all sessions for this course
     records = (
         db.query(ClassSession, Classroom)
         .join(Classroom, ClassSession.classroom_id == Classroom.classroom_id)
@@ -447,6 +519,15 @@ def get_course_sessions(
         "sessions": [
             {
                 "session_id": session.session_id,
+                "session_type": session.session_type or "theory",
+                "section": (
+                    {
+                        "section_id": session.section.section_id,
+                        "section_name": session.section.section_name
+                    }
+                    if session.section is not None
+                    else None
+                ),
                 "session_date": str(session.session_date),
                 "start_time": str(session.start_time),
                 "end_time": str(session.end_time),
@@ -490,7 +571,10 @@ def get_course_attendance_summary(
     course_sessions = (
         db.query(ClassSession)
         .filter(ClassSession.course_id == course_id)
-        .order_by(ClassSession.session_date.asc(), ClassSession.start_time.asc())
+        .order_by(
+            ClassSession.session_date.asc(),
+            ClassSession.start_time.asc()
+        )
         .all()
     )
 
@@ -515,6 +599,37 @@ def get_course_attendance_summary(
         (attendance.session_id, attendance.student_id)
         for attendance in attendance_records
     }
+    section_ids = {
+        student_course.section_id
+        for student_course, student in enrolled_records
+        if student_course.section_id is not None
+    }
+
+    section_name_lookup = {}
+
+    if section_ids:
+        section_records = (
+            db.query(CourseSection.section_id, CourseSection.section_name)
+            .filter(CourseSection.section_id.in_(section_ids))
+            .all()
+        )
+
+        section_name_lookup = {
+            section_id: section_name
+            for section_id, section_name in section_records
+        }
+
+    total_theory_sessions = sum(
+        1
+        for session in course_sessions
+        if (session.session_type or "theory") == "theory"
+    )
+
+    total_practical_sessions = sum(
+        1
+        for session in course_sessions
+        if (session.session_type or "theory") == "practical"
+    )
 
     student_summaries = []
 
@@ -524,28 +639,40 @@ def get_course_attendance_summary(
         total_sessions = 0
 
         for session in course_sessions:
+            session_type = session.session_type or "theory"
+
+            # Theory belongs to every enrolled student.
+            # Practical belongs only to the student's selected section.
+            if (
+                session_type == "practical"
+                and student_course.section_id != session.section_id
+            ):
+                continue
+
             attendance_close_dt = datetime.combine(
                 session.session_date,
                 session.attendance_close_time
             )
 
-            has_attended = (session.session_id, student.student_id) in attendance_lookup
+            has_attended = (
+                session.session_id,
+                student.student_id
+            ) in attendance_lookup
 
-            # Count immediately if this student attended
             if has_attended:
                 attended_count += 1
                 total_sessions += 1
-            # Count as absent only after this session's window closes
             elif attendance_close_dt <= now:
                 absent_count += 1
                 total_sessions += 1
-            # Otherwise do not count yet
-            else:
-                pass
 
         attendance_percentage = 0.0
+
         if total_sessions > 0:
-            attendance_percentage = round((attended_count / total_sessions) * 100, 2)
+            attendance_percentage = round(
+                (attended_count / total_sessions) * 100,
+                2
+            )
 
         if total_sessions == 0:
             attendance_status = "No Sessions Yet"
@@ -564,6 +691,10 @@ def get_course_attendance_summary(
             "email": student.email,
             "university_number": student.university_number,
             "year_of_study": student.year_of_study,
+            "selected_section_id": student_course.section_id,
+            "selected_section_name": section_name_lookup.get(
+                student_course.section_id
+            ),
             "attended_sessions": attended_count,
             "absent_sessions": absent_count,
             "total_sessions": total_sessions,
@@ -583,9 +714,14 @@ def get_course_attendance_summary(
             "full_name": current_teacher.full_name
         },
         "summary": {
-            "total_course_sessions": len(course_sessions),
+            "total_theory_sessions": total_theory_sessions,
+            "total_practical_sessions": total_practical_sessions,
             "total_enrolled_students": len(enrolled_records),
-            "counting_rule": "Attended sessions are counted immediately for each student; absences are counted only after that student's attendance window closes"
+            "counting_rule": (
+                "Theory sessions are counted for every enrolled student. "
+                "Practical sessions are counted only for the student's "
+                "selected practical section."
+            )
         },
         "students": student_summaries
     }
@@ -685,19 +821,33 @@ def get_classroom_sessions_history(
     session_ids = [session.session_id for session, course in records]
     course_ids = list({course.course_id for session, course in records})
 
-    # 7) Build enrolled-count lookup per course
-    enrolled_count_lookup = {}
+    # 7) Build eligible-student count lookup per session.
+    # Theory sessions include every enrolled student in the course.
+    # Practical sessions include only students assigned to that section.
+    eligible_count_lookup = {}
 
-    if course_ids:
-        enrolled_records = (
-            db.query(StudentCourse.course_id, StudentCourse.student_id)
-            .filter(StudentCourse.course_id.in_(course_ids))
+    if session_ids:
+        session_records = (
+            db.query(ClassSession)
+            .filter(ClassSession.session_id.in_(session_ids))
             .all()
         )
 
-        for course_id_value, student_id_value in enrolled_records:
-            enrolled_count_lookup[course_id_value] = (
-                enrolled_count_lookup.get(course_id_value, 0) + 1
+        for session in session_records:
+            session_type = session.session_type or "theory"
+
+            eligible_students_query = (
+                db.query(StudentCourse)
+                .filter(StudentCourse.course_id == session.course_id)
+            )
+
+            if session_type == "practical":
+                eligible_students_query = eligible_students_query.filter(
+                    StudentCourse.section_id == session.section_id
+                )
+
+            eligible_count_lookup[session.session_id] = (
+                eligible_students_query.count()
             )
 
     # 8) Build present-count lookup per session
@@ -730,7 +880,7 @@ def get_classroom_sessions_history(
 
         attendance_finalized = attendance_close_dt <= now
 
-        total_enrolled = enrolled_count_lookup.get(course.course_id, 0)
+        total_enrolled = eligible_count_lookup.get(session.session_id, 0)
         total_present = present_count_lookup.get(session.session_id, 0)
 
         total_absent = 0
@@ -755,7 +905,13 @@ def get_classroom_sessions_history(
             "total_enrolled": total_enrolled,
             "total_present": total_present,
             "total_absent": total_absent,
-            "attendance_percentage": attendance_percentage
+            "attendance_percentage": attendance_percentage,
+            "session_type": session.session_type or "theory",
+            "section_name": (
+                session.section.section_name
+                if session.section is not None
+                else None
+            ),
         })
 
     return {
