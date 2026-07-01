@@ -7,7 +7,7 @@ from app.core.config import SESSION_PDFS_DIR
 from datetime import datetime
 from app.core.time_utils import now_syria
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.orm import Session
 
 from typing import Optional
@@ -329,6 +329,145 @@ def delete_teacher_session(
 
 
 
+
+@router.put("/sessions/{session_id}/students/{student_id}/manual-attendance")
+def mark_manual_attendance(
+    session_id: int,
+    student_id: int,
+    status: str = Body(..., embed=True),
+    manual_note: Optional[str] = Body(default=None, embed=True),
+    current_teacher: Teacher = Depends(get_current_teacher),
+    db: Session = Depends(get_db)
+):
+    session_record = (
+        db.query(ClassSession, Course)
+        .join(Course, ClassSession.course_id == Course.course_id)
+        .filter(
+            ClassSession.session_id == session_id,
+            Course.teacher_id == current_teacher.teacher_id
+        )
+        .first()
+    )
+
+    if not session_record:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found or does not belong to this teacher"
+        )
+
+    session, course = session_record
+
+    clean_status = status.strip().lower()
+
+    if clean_status not in ["present", "absent"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be either present or absent"
+        )
+
+    eligible_student_query = (
+        db.query(StudentCourse)
+        .filter(
+            StudentCourse.student_id == student_id,
+            StudentCourse.course_id == course.course_id
+        )
+    )
+
+    if (session.session_type or "theory") == "practical":
+        eligible_student_query = eligible_student_query.filter(
+            StudentCourse.section_id == session.section_id
+        )
+
+    enrollment = eligible_student_query.first()
+
+    if not enrollment:
+        raise HTTPException(
+            status_code=403,
+            detail="This student is not eligible for this session"
+        )
+
+    student = (
+        db.query(Student)
+        .filter(Student.student_id == student_id)
+        .first()
+    )
+
+    if not student:
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found"
+        )
+
+    existing_attendance = (
+        db.query(Attendance)
+        .filter(
+            Attendance.student_id == student_id,
+            Attendance.session_id == session_id
+        )
+        .first()
+    )
+
+    manual_time = now_syria().replace(tzinfo=None)
+
+    if existing_attendance:
+        existing_attendance.status = clean_status
+        existing_attendance.attendance_method = "manual"
+        existing_attendance.marked_by_teacher_id = current_teacher.teacher_id
+        existing_attendance.manual_note = (
+            manual_note.strip()
+            if manual_note and manual_note.strip()
+            else None
+        )
+        existing_attendance.manually_marked_at = manual_time
+
+        attendance = existing_attendance
+        action = "updated"
+
+    else:
+        attendance = Attendance(
+            student_id=student_id,
+            session_id=session_id,
+            status=clean_status,
+            attendance_method="manual",
+            marked_by_teacher_id=current_teacher.teacher_id,
+            manual_note=(
+                manual_note.strip()
+                if manual_note and manual_note.strip()
+                else None
+            ),
+            manually_marked_at=manual_time
+        )
+
+        db.add(attendance)
+        action = "created"
+
+    db.commit()
+    db.refresh(attendance)
+
+    return {
+        "message": f"Manual attendance {action} successfully",
+        "attendance": {
+            "attendance_id": attendance.attendance_id,
+            "student_id": student.student_id,
+            "student_name": student.full_name,
+            "session_id": session.session_id,
+            "status": attendance.status,
+            "attendance_method": attendance.attendance_method,
+            "manual_note": attendance.manual_note,
+            "marked_by_teacher_id": attendance.marked_by_teacher_id,
+            "manually_marked_at": (
+                str(attendance.manually_marked_at)
+                if attendance.manually_marked_at
+                else None
+            )
+        }
+    }
+
+
+
+
+
+
 @router.get("/sessions/{session_id}/attendance-report")
 def get_session_attendance_report(
     session_id: int,
@@ -355,20 +494,18 @@ def get_session_attendance_report(
     session, course, classroom = session_record
     session_type = session.session_type or "theory"
 
-    enrolled_query = (
+    eligible_query = (
         db.query(StudentCourse, Student)
         .join(Student, StudentCourse.student_id == Student.student_id)
         .filter(StudentCourse.course_id == course.course_id)
     )
 
-    # Theory: every enrolled student belongs to the report.
-    # Practical: only students assigned to this exact section belong to it.
     if session_type == "practical":
-        enrolled_query = enrolled_query.filter(
+        eligible_query = eligible_query.filter(
             StudentCourse.section_id == session.section_id
         )
 
-    enrolled_records = enrolled_query.all()
+    enrolled_records = eligible_query.all()
 
     eligible_student_ids = {
         student.student_id
@@ -387,25 +524,10 @@ def get_session_attendance_report(
         else []
     )
 
-    attended_student_ids = {
-        attendance.student_id
+    attendance_by_student_id = {
+        attendance.student_id: attendance
         for attendance, student in attendance_records
     }
-
-    present_students = [
-        {
-            "student_id": student.student_id,
-            "full_name": student.full_name,
-            "email": student.email,
-            "university_number": student.university_number,
-            "status": attendance.status,
-            "confidence_score": attendance.confidence_score,
-            "distance_from_class_meters": attendance.distance_from_class_meters,
-            "captured_at": str(attendance.captured_at),
-            "image_path": attendance.image_path
-        }
-        for attendance, student in attendance_records
-    ]
 
     now = now_syria()
 
@@ -416,21 +538,65 @@ def get_session_attendance_report(
 
     attendance_finalized = attendance_close_dt <= now
 
-    absent_students = [
-        {
-            "student_id": student.student_id,
-            "full_name": student.full_name,
-            "email": student.email,
-            "university_number": student.university_number,
-            "year_of_study": student.year_of_study,
-            "attendance_status": "Absent"
-        }
-        for student_course, student in enrolled_records
-        if (
-            student.student_id not in attended_student_ids
-            and attendance_finalized
-        )
-    ]
+    students = []
+    present_students = []
+    absent_students = []
+
+    for student_course, student in enrolled_records:
+        attendance = attendance_by_student_id.get(student.student_id)
+
+        if attendance:
+            status = attendance.status.capitalize()
+            attendance_method = attendance.attendance_method or "face"
+
+            student_data = {
+                "student_id": student.student_id,
+                "full_name": student.full_name,
+                "email": student.email,
+                "university_number": student.university_number,
+                "year_of_study": student.year_of_study,
+                "status": status,
+                "attendance_method": attendance_method,
+                "confidence_score": attendance.confidence_score,
+                "distance_from_class_meters": attendance.distance_from_class_meters,
+                "captured_at": str(attendance.captured_at),
+                "manual_note": attendance.manual_note,
+                "marked_by_teacher_id": attendance.marked_by_teacher_id,
+                "manually_marked_at": (
+                    str(attendance.manually_marked_at)
+                    if attendance.manually_marked_at
+                    else None
+                )
+            }
+
+            if attendance.status == "present":
+                present_students.append(student_data)
+            else:
+                absent_students.append(student_data)
+
+        else:
+            status = "Absent" if attendance_finalized else "Not marked"
+
+            student_data = {
+                "student_id": student.student_id,
+                "full_name": student.full_name,
+                "email": student.email,
+                "university_number": student.university_number,
+                "year_of_study": student.year_of_study,
+                "status": status,
+                "attendance_method": None,
+                "confidence_score": None,
+                "distance_from_class_meters": None,
+                "captured_at": None,
+                "manual_note": None,
+                "marked_by_teacher_id": None,
+                "manually_marked_at": None
+            }
+
+            if attendance_finalized:
+                absent_students.append(student_data)
+
+        students.append(student_data)
 
     section_data = None
 
@@ -470,8 +636,14 @@ def get_session_attendance_report(
             "attendance_finalized": attendance_finalized,
             "total_enrolled": len(enrolled_records),
             "total_present": len(present_students),
-            "total_absent": len(absent_students) if attendance_finalized else 0
+            "total_absent": len(absent_students),
+            "total_not_marked": len([
+                student
+                for student in students
+                if student["status"] == "Not marked"
+            ])
         },
+        "students": students,
         "present_students": present_students,
         "absent_students": absent_students
     }
@@ -595,8 +767,8 @@ def get_course_attendance_summary(
             .all()
         )
 
-    attendance_lookup = {
-        (attendance.session_id, attendance.student_id)
+    attendance_status_lookup = {
+        (attendance.session_id, attendance.student_id): attendance.status
         for attendance in attendance_records
     }
     section_ids = {
@@ -654,13 +826,15 @@ def get_course_attendance_summary(
                 session.attendance_close_time
             )
 
-            has_attended = (
-                session.session_id,
-                student.student_id
-            ) in attendance_lookup
+            attendance_status = attendance_status_lookup.get(
+                (session.session_id, student.student_id)
+            )
 
-            if has_attended:
+            if attendance_status == "present":
                 attended_count += 1
+                total_sessions += 1
+            elif attendance_status == "absent":
+                absent_count += 1
                 total_sessions += 1
             elif attendance_close_dt <= now:
                 absent_count += 1
@@ -863,7 +1037,7 @@ def get_classroom_sessions_history(
             .all()
         )
 
-        for session_id_value, student_id_value in attendance_records:
+        for session_id_value, _student_id_value in attendance_records:
             present_count_lookup[session_id_value] = (
                 present_count_lookup.get(session_id_value, 0) + 1
             )

@@ -126,14 +126,14 @@ def submit_attendance(
                 )
             )
 
-    if enrollment.section_id != session.section_id:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "You are not assigned to the practical section "
-                "for this session"
+        if enrollment.section_id != session.section_id:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "You are not assigned to the practical section "
+                    "for this session"
+                )
             )
-        )
 
     # 4) Check duplicate attendance
 

@@ -158,6 +158,113 @@ def get_sessions(
     return result
 
 
+
+
+@router.get("/student/timetable")
+def get_student_timetable(
+    current_student: Student = Depends(get_current_student),
+    db: Session = Depends(get_db)
+):
+    enrollments = (
+        db.query(StudentCourse)
+        .filter(StudentCourse.student_id == current_student.student_id)
+        .all()
+    )
+
+    if not enrollments:
+        return {
+            "student_id": current_student.student_id,
+            "sessions": []
+        }
+
+    enrollment_by_course = {
+        enrollment.course_id: enrollment
+        for enrollment in enrollments
+    }
+
+    course_ids = list(enrollment_by_course.keys())
+    now = now_syria()
+
+    records = (
+        db.query(ClassSession, Course, Classroom)
+        .join(Course, ClassSession.course_id == Course.course_id)
+        .join(Classroom, ClassSession.classroom_id == Classroom.classroom_id)
+        .filter(
+            ClassSession.course_id.in_(course_ids),
+            ClassSession.session_date >= now.date()
+        )
+        .order_by(
+            ClassSession.session_date.asc(),
+            ClassSession.start_time.asc()
+        )
+        .all()
+    )
+
+    sessions = []
+
+    for session, course, classroom in records:
+        enrollment = enrollment_by_course[course.course_id]
+        session_type = session.session_type or "theory"
+
+        # Theory is visible to every enrolled student.
+        # Practical is visible only to the selected practical section.
+        if (
+            session_type == "practical"
+            and enrollment.section_id != session.section_id
+        ):
+            continue
+
+        session_start_dt = datetime.combine(
+            session.session_date,
+            session.start_time
+        )
+
+        # Do not show sessions that already started.
+        if session_start_dt < now:
+            continue
+
+        section_data = None
+
+        if session_type == "practical" and session.section:
+            section_data = {
+                "section_id": session.section.section_id,
+                "section_name": session.section.section_name
+            }
+
+        sessions.append({
+            "session_id": session.session_id,
+            "session_type": session_type,
+            "session_date": str(session.session_date),
+            "start_time": str(session.start_time),
+            "end_time": str(session.end_time),
+            "attendance_open_time": str(session.attendance_open_time),
+            "attendance_close_time": str(session.attendance_close_time),
+            "course": {
+                "course_id": course.course_id,
+                "course_name": course.course_name,
+                "year_of_study": course.year_of_study
+            },
+            "classroom": {
+                "classroom_id": classroom.classroom_id,
+                "name": classroom.name,
+                "building": classroom.building,
+                "room_number": classroom.room_number
+            },
+            "section": section_data
+        })
+
+    return {
+        "student_id": current_student.student_id,
+        "generated_at": str(now),
+        "total_upcoming_sessions": len(sessions),
+        "sessions": sessions
+    }
+
+
+
+
+
+
 @router.get("/student/course-attendance-summary")
 def get_student_course_attendance_summary(
     current_student: Student = Depends(get_current_student),
@@ -183,46 +290,49 @@ def get_student_course_attendance_summary(
             .all()
         )
 
-        counted_sessions = []
+        attended_count = 0
+        absent_count = 0
+        total_sessions = 0
 
         for session in all_course_sessions:
-            attendance = db.query(Attendance).filter(
-                Attendance.session_id == session.session_id,
-                Attendance.student_id == current_student.student_id
-            ).first()
+            session_type = session.session_type or "theory"
+
+            if (
+                session_type == "practical"
+                and enrollment.section_id != session.section_id
+            ):
+                continue
+
+            attendance = (
+                db.query(Attendance)
+                .filter(
+                    Attendance.session_id == session.session_id,
+                    Attendance.student_id == current_student.student_id
+                )
+                .first()
+            )
 
             attendance_close_dt = datetime.combine(
                 session.session_date,
                 session.attendance_close_time
             )
 
-            # Count immediately if attended
-            if attendance:
-                counted_sessions.append(session)
-            # Count as finalized absent only after window closes
+            if attendance and attendance.status == "present":
+                attended_count += 1
+                total_sessions += 1
+            elif attendance and attendance.status == "absent":
+                absent_count += 1
+                total_sessions += 1
             elif attendance_close_dt <= now:
-                counted_sessions.append(session)
-
-        total_sessions = len(counted_sessions)
-        session_ids = [session.session_id for session in counted_sessions]
-
-        attended_count = 0
-
-        if session_ids:
-            attended_count = (
-                db.query(Attendance)
-                .filter(
-                    Attendance.student_id == current_student.student_id,
-                    Attendance.session_id.in_(session_ids)
-                )
-                .count()
-            )
-
-        absent_count = total_sessions - attended_count if total_sessions > 0 else 0
+                absent_count += 1
+                total_sessions += 1
 
         attendance_percentage = 0.0
         if total_sessions > 0:
-            attendance_percentage = round((attended_count / total_sessions) * 100, 2)
+            attendance_percentage = round(
+                (attended_count / total_sessions) * 100,
+                2
+            )
 
         if total_sessions == 0:
             attendance_status = "No Sessions Yet"
@@ -489,8 +599,6 @@ def get_student_attendance(
         enrollment = enrollment_by_course[session.course_id]
         session_type = session.session_type or "theory"
 
-        # Theory belongs to every enrolled student.
-        # Practical belongs only to the student's selected section.
         if (
             session_type == "practical"
             and enrollment.section_id != session.section_id
@@ -511,8 +619,10 @@ def get_student_attendance(
             session.attendance_close_time
         )
 
-        if attendance:
+        if attendance and attendance.status == "present":
             status = "Present"
+        elif attendance and attendance.status == "absent":
+            status = "Absent"
         elif attendance_close_dt > now:
             continue
         else:
@@ -525,7 +635,12 @@ def get_student_attendance(
             "session_date": str(session.session_date),
             "start_time": str(session.start_time),
             "end_time": str(session.end_time),
-            "status": status
+            "status": status,
+            "attendance_method": (
+                attendance.attendance_method
+                if attendance
+                else None
+            )
         })
 
     result.sort(
@@ -747,8 +862,11 @@ def get_student_my_courses(
                 session.attendance_close_time
             )
 
-            if attendance:
+            if attendance and attendance.status == "present":
                 attended_count += 1
+                total_sessions += 1
+            elif attendance and attendance.status == "absent":
+                absent_count += 1
                 total_sessions += 1
             elif attendance_close_dt <= now:
                 absent_count += 1
@@ -1164,8 +1282,10 @@ def get_student_notifications(
                 session.attendance_close_time
             )
 
-            if attendance:
+            if attendance and attendance.status == "present":
                 attended_count += 1
+                total_counted_sessions += 1
+            elif attendance and attendance.status == "absent":
                 total_counted_sessions += 1
             elif attendance_close_dt <= now:
                 total_counted_sessions += 1

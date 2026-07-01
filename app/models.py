@@ -55,6 +55,10 @@ class Teacher(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     courses = relationship("Course", back_populates="teacher", cascade="all, delete-orphan")
+    manual_attendances = relationship(
+        "Attendance",
+        foreign_keys="Attendance.marked_by_teacher_id"
+    )
 
 
 class Classroom(Base):
@@ -286,9 +290,28 @@ class Attendance(Base):
     image_path = Column(String(255), nullable=True)
 
     captured_at = Column(DateTime, server_default=func.now())
+    attendance_method = Column(
+        String(20),
+        nullable=False,
+        default="face"
+    )
+
+    marked_by_teacher_id = Column(
+        Integer,
+        ForeignKey("teachers.teacher_id"),
+        nullable=True
+    )
+
+    manual_note = Column(String(500), nullable=True)
+
+    manually_marked_at = Column(DateTime, nullable=True)
 
     student = relationship("Student", back_populates="attendances")
     session = relationship("ClassSession", back_populates="attendances")
+    marked_by_teacher = relationship(
+        "Teacher",
+        foreign_keys=[marked_by_teacher_id]
+    )
 
 
 class StudentFaceEmbedding(Base):
